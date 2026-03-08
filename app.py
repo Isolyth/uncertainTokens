@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
-MODEL_ID = "Qwen/Qwen3.5-4B"
+MODEL_ID = "Qwen/Qwen3.5-2B"
 
 print(f"Downloading {MODEL_ID}...")
 snapshot_download(MODEL_ID)
@@ -38,7 +38,7 @@ embed_layer = model.get_input_embeddings()
 _embed_cpu = embed_layer.weight.detach().float().cpu()
 _embed_cpu_norm = F.normalize(_embed_cpu, dim=-1)
 
-MIX_THRESHOLD = 0.65  # Mix when top1 - top2 < this
+MIX_THRESHOLD = 1  # Mix when top1 - top2 < this
 
 
 def _decode_single_token(tokenizer, tid):
