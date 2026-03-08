@@ -38,7 +38,15 @@ embed_layer = model.get_input_embeddings()
 _embed_cpu = embed_layer.weight.detach().float().cpu()
 _embed_cpu_norm = F.normalize(_embed_cpu, dim=-1)
 
-MIX_THRESHOLD = 0.5  # Mix when top1 - top2 < this
+MIX_THRESHOLD = 0.65  # Mix when top1 - top2 < this
+
+
+def _decode_single_token(tokenizer, tid):
+    """Decode a single token for display, falling back to vocab entry for byte-level tokens."""
+    text = tokenizer.decode([tid])
+    if text and '\ufffd' not in text:
+        return text
+    return tokenizer.convert_ids_to_tokens([tid])[0]
 
 
 def find_nearest_token(mixed_embed: torch.Tensor) -> int:
@@ -70,6 +78,9 @@ def generate_tokens(messages: list[dict]):
 
     past_key_values = None
     model_inputs = inputs
+    # Accumulate token IDs for proper multi-byte Unicode decoding
+    all_token_ids = []
+    prev_text = ""
 
     for _ in range(max_new_tokens):
         with torch.no_grad():
@@ -81,7 +92,7 @@ def generate_tokens(messages: list[dict]):
         probs = F.softmax(logits[0].float(), dim=-1)
         top10_probs, top10_ids = torch.topk(probs, 10)
         top_tokens = [
-            {"token": tokenizer.decode([tid]), "prob": round(tp, 4)}
+            {"token": _decode_single_token(tokenizer, tid), "prob": round(tp, 4)}
             for tid, tp in zip(top10_ids.tolist(), top10_probs.tolist())
         ]
         uncertainty = 1.0 - top10_probs[0].item()
@@ -97,11 +108,20 @@ def generate_tokens(messages: list[dict]):
             mixed_embed = (weights.unsqueeze(-1) * top10_embeds).sum(dim=0)  # [hidden_dim]
 
             nearest_id = find_nearest_token(mixed_embed)
-            display_text = tokenizer.decode([nearest_id])
 
             # Check EOS on nearest token (best proxy)
             if nearest_id in eos_ids:
                 break
+
+            all_token_ids.append(nearest_id)
+            full_text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+            display_text = full_text[len(prev_text):]
+
+            if not display_text or '\ufffd' in display_text:
+                # Incomplete multi-byte character, buffer until next token completes it
+                model_inputs = {"inputs_embeds": mixed_embed.unsqueeze(0).unsqueeze(0).to(model.dtype)}
+                continue
+            prev_text = full_text
 
             data = json.dumps({
                 "token": display_text,
@@ -130,7 +150,16 @@ def generate_tokens(messages: list[dict]):
             if next_token_id.item() in eos_ids:
                 break
 
-            token_text = tokenizer.decode(next_token_id.tolist())
+            all_token_ids.append(next_token_id.item())
+            full_text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
+            token_text = full_text[len(prev_text):]
+
+            if not token_text or '\ufffd' in token_text:
+                # Incomplete multi-byte character, buffer until next token completes it
+                model_inputs = {"input_ids": next_token_id.unsqueeze(0)}
+                continue
+            prev_text = full_text
+
             data = json.dumps({
                 "token": token_text,
                 "uncertainty": round(uncertainty, 4),
@@ -364,7 +393,7 @@ document.addEventListener('mouseover', e => {
     const isMix = tok.dataset.mix === '1';
     const label = isMix ? '<div style="color:#b88cff;font-weight:bold;margin-bottom:4px">MIX TOKEN (weighted blend)</div>' : '';
     let rows = top.map(t =>
-        `<tr><td class="tok-name">${escapeHtml(JSON.stringify(t.token))}</td><td class="tok-prob">${(t.prob * 100).toFixed(1)}%</td></tr>`
+        `<tr><td class="tok-name">${escapeHtml(t.token)}</td><td class="tok-prob">${(t.prob * 100).toFixed(1)}%</td></tr>`
     ).join('');
     tooltip.innerHTML = label + '<table>' + rows + '</table>';
     tooltip.style.display = 'block';
