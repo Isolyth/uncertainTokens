@@ -6,7 +6,7 @@ import html
 import torch
 import torch.nn.functional as F
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
@@ -43,7 +43,7 @@ embed_layer = model.get_input_embeddings()
 _embed_cpu = embed_layer.weight.detach().float().cpu()
 _embed_cpu_norm = F.normalize(_embed_cpu, dim=-1)
 
-MIX_THRESHOLD = 0.65  # Mix when top1 - top2 < this
+mix_threshold = 0.65  # Mix when top1 - top2 < this
 
 
 def _decode_single_token(tokenizer, tid):
@@ -103,7 +103,7 @@ def generate_tokens(messages: list[dict]):
         uncertainty = 1.0 - top10_probs[0].item()
 
         gap = (top10_probs[0] - top10_probs[1]).item()
-        is_mix = gap < MIX_THRESHOLD
+        is_mix = mix_threshold > 0 and gap < mix_threshold
 
         if is_mix:
             # Mix token: weighted average of top-10 embeddings
@@ -186,6 +186,17 @@ async def chat(req: ChatRequest):
     )
 
 
+class ThresholdRequest(BaseModel):
+    value: float
+
+
+@app.post("/mix-threshold")
+async def set_mix_threshold(req: ThresholdRequest):
+    global mix_threshold
+    mix_threshold = max(0.0, min(1.0, req.value))
+    return JSONResponse({"mix_threshold": mix_threshold})
+
+
 @app.get("/")
 async def index():
     return HTMLResponse(INDEX_HTML)
@@ -260,6 +271,9 @@ body {
 }
 #input-bar button:hover { background: #3a5a7c; }
 #input-bar button:disabled { opacity: 0.5; cursor: default; }
+#mix-controls { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #8cf; white-space: nowrap; }
+#mix-slider { width: 100px; accent-color: #6448c8; }
+#mix-label { min-width: 70px; }
 
 /* Tokens */
 .tok {
@@ -298,6 +312,10 @@ body {
 <body>
 <div id="chat"></div>
 <div id="input-bar">
+    <div id="mix-controls">
+        <span id="mix-label">Mix: 0.65</span>
+        <input id="mix-slider" type="range" min="0" max="100" value="65" title="0 = off, 100 = mix everything">
+    </div>
     <input id="msg" type="text" placeholder="Type a message..." autofocus>
     <button id="send">Send</button>
 </div>
@@ -388,6 +406,21 @@ async function send() {
 
 sendBtn.addEventListener('click', send);
 msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+const mixSlider = document.getElementById('mix-slider');
+const mixLabel = document.getElementById('mix-label');
+mixSlider.addEventListener('input', () => {
+    const v = (mixSlider.value / 100).toFixed(2);
+    mixLabel.textContent = mixSlider.value == 0 ? 'Mix: OFF' : 'Mix: ' + v;
+});
+mixSlider.addEventListener('change', async () => {
+    const v = mixSlider.value / 100;
+    await fetch('/mix-threshold', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({value: v}),
+    });
+});
 
 // Tooltip
 document.addEventListener('mouseover', e => {
