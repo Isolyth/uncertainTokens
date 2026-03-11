@@ -11,19 +11,24 @@ from pydantic import BaseModel
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
-MODEL_ID = "Qwen/Qwen3.5-4B"
+MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3.5-4B")
+QUANTIZE = os.environ.get("QUANTIZE", "8bit")  # "8bit", "none"
 
 print(f"Downloading {MODEL_ID}...")
 snapshot_download(MODEL_ID)
-print("Download complete. Loading model in 8-bit...")
 
-quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+load_kwargs = dict(device_map="auto", attn_implementation="sdpa")
+if QUANTIZE == "8bit":
+    print("Loading model in 8-bit...")
+    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+        load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=True
+    )
+else:
+    print("Loading model in fp16...")
+    load_kwargs["torch_dtype"] = torch.float16
+
 processor = AutoProcessor.from_pretrained(MODEL_ID)
-model = AutoModelForImageTextToText.from_pretrained(
-    MODEL_ID,
-    quantization_config=quantization_config,
-    device_map="auto",
-)
+model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **load_kwargs)
 print("Model loaded.")
 
 app = FastAPI()
