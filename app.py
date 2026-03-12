@@ -1,18 +1,35 @@
 import os
-os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "300"
+import tomllib
+from pathlib import Path
+
+# Load config: config.toml values, overridden by env vars
+_config = {}
+_config_path = Path(__file__).parent / "config.toml"
+if _config_path.exists():
+    with open(_config_path, "rb") as f:
+        _config = tomllib.load(f)
+
+
+def _cfg(key: str, default=None):
+    """Get config value: env var takes precedence, then config.toml, then default."""
+    return os.environ.get(key.upper(), _config.get(key, default))
+
+
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")
 
 import json
 import html
+import secrets
 import torch
 import torch.nn.functional as F
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
-MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen3.5-4B")
-QUANTIZE = os.environ.get("QUANTIZE", "8bit")  # "8bit", "none"
+MODEL_ID = _cfg("model_id", "Qwen/Qwen3.5-4B")
+QUANTIZE = _cfg("quantize", "8bit")
 
 print(f"Downloading {MODEL_ID}...")
 snapshot_download(MODEL_ID)
@@ -32,6 +49,27 @@ model = AutoModelForImageTextToText.from_pretrained(MODEL_ID, **load_kwargs)
 print("Model loaded.")
 
 app = FastAPI()
+AUTH_PASSWORD = _cfg("auth_password")
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    if not AUTH_PASSWORD:
+        return await call_next(request)
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Basic "):
+        import base64
+        try:
+            decoded = base64.b64decode(auth[6:]).decode()
+            _, password = decoded.split(":", 1)
+            if secrets.compare_digest(password, AUTH_PASSWORD):
+                return await call_next(request)
+        except Exception:
+            pass
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="uncertainTokens"'},
+    )
 
 
 class ChatRequest(BaseModel):
@@ -43,7 +81,7 @@ embed_layer = model.get_input_embeddings()
 _embed_cpu = embed_layer.weight.detach().float().cpu()
 _embed_cpu_norm = F.normalize(_embed_cpu, dim=-1)
 
-mix_threshold = 0.65  # Mix when top1 - top2 < this
+mix_threshold = float(_cfg("mix_threshold", 0.65))
 
 
 def _decode_single_token(tokenizer, tid):

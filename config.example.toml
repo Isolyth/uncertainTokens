@@ -1,0 +1,9 @@
+# Model configuration
+model_id = "Qwen/Qwen3.5-4B"
+quantize = "8bit"          # "8bit" or "none"
+
+# Token mixing
+mix_threshold = 0.65       # 0 = off, 1.0 = mix everything
+
+# Auth (uncomment to enable)
+# auth_password = "your-password-here"
