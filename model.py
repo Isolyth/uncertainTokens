@@ -1,3 +1,6 @@
+import gc
+import os
+
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
@@ -5,9 +8,18 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndByte
 
 from config import MODEL_ID
 
+# Reduce CUDA memory fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 print(f"Downloading {MODEL_ID}...")
 snapshot_download(MODEL_ID)
 print("Download complete. Loading model in 8-bit...")
+
+# Flush any stale CUDA allocations before loading
+gc.collect()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
 
 quantization_config = BitsAndBytesConfig(load_in_8bit=True)
 processor = AutoProcessor.from_pretrained(MODEL_ID)

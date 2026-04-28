@@ -202,6 +202,9 @@ async function send() {
                 if (data.sequence_length) {
                     span.dataset.seqLen = data.sequence_length;
                 }
+                if (data.components) {
+                    span.dataset.components = JSON.stringify(data.components);
+                }
                 assistantDiv.appendChild(span);
                 chat.scrollTop = chat.scrollHeight;
             }
@@ -234,7 +237,12 @@ document.addEventListener('mouseover', e => {
     let label = '';
     if (isMultimix) {
         const seqLen = tok.dataset.seqLen || '?';
-        label = '<div style="color:#ff3296;font-weight:bold;margin-bottom:4px">MULTI-MIX (' + seqLen + ' tokens collapsed)</div>';
+        let compStr = '';
+        if (tok.dataset.components) {
+            const comps = JSON.parse(tok.dataset.components);
+            compStr = '<div style="color:#ccc;margin-bottom:4px">' + comps.map(c => '<span style="background:#333;padding:1px 4px;border-radius:3px;margin:0 2px">' + escapeHtml(c) + '</span>').join(' + ') + '</div>';
+        }
+        label = '<div style="color:#ff3296;font-weight:bold;margin-bottom:4px">MULTI-MIX (' + seqLen + ' tokens collapsed)</div>' + compStr;
     } else if (isMix) {
         label = '<div style="color:#b88cff;font-weight:bold;margin-bottom:4px">MIX TOKEN (weighted blend)</div>';
     }

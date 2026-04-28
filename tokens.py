@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from config import (
     TEMPERATURE, TOP_P, MAX_NEW_TOKENS,
     MIX_THRESHOLD, MULTIMIX_THRESHOLD, MULTIMIX_MAX_TOKENS, MULTIMIX_CERTAINTY_GAP,
+    MULTIMIX_COOLDOWN, MULTIMIX_UNIQUE_ONLY,
 )
 from model import model, processor, embed_layer, find_nearest_token, decode_single_token
 
@@ -159,8 +160,11 @@ def generate_tokens(messages: list[dict]):
     multimix_top_info = []     # top-token info for each position (for display)
     multimix_token_ids = []    # nearest-token IDs added during sequence (to roll back)
     multimix_uncertainties = []
+    multimix_components = []   # decoded text for each component token in the sequence
     # Track KV cache length at start of multimix sequence for rollback
     multimix_kv_start_len = 0
+    # Cooldown: tokens since last multimix completed
+    multimix_cooldown = MULTIMIX_COOLDOWN  # start ready (cooldown already elapsed)
 
     for step in range(MAX_NEW_TOKENS):
         outputs = _forward_step(model_inputs, past_key_values)
@@ -180,17 +184,23 @@ def generate_tokens(messages: list[dict]):
 
         if multimix_active:
             is_certain_enough = gap >= MULTIMIX_CERTAINTY_GAP
+            # Check if this token would be a duplicate
+            _duplicate = False
             if not is_certain_enough and is_very_uncertain and len(multimix_embeds) < MULTIMIX_MAX_TOKENS:
-                # Still uncertain — continue recording the sequence
                 mix_embed = _compute_mix_embed(top10_probs, top10_ids)
+                nearest_id = find_nearest_token(mix_embed)
+                if nearest_id in eos_ids:
+                    break
+                _duplicate = MULTIMIX_UNIQUE_ONLY and nearest_id in multimix_token_ids
+
+            if not is_certain_enough and is_very_uncertain and len(multimix_embeds) < MULTIMIX_MAX_TOKENS and not _duplicate:
+                # Still uncertain, no duplicate — continue recording the sequence
                 multimix_embeds.append(mix_embed)
                 multimix_top_info.append(top_tokens)
                 multimix_uncertainties.append(uncertainty)
 
-                nearest_id = find_nearest_token(mix_embed)
-                if nearest_id in eos_ids:
-                    break
                 multimix_token_ids.append(nearest_id)
+                multimix_components.append(decode_single_token(nearest_id))
                 all_token_ids.append(nearest_id)
 
                 # Feed mix embed to continue generation
@@ -199,67 +209,93 @@ def generate_tokens(messages: list[dict]):
 
             else:
                 # Sequence ended: either we hit a certain token or max length.
-                # This current token is the "anchor" — the certain token after the sequence.
-                # We need its attention over the sequence positions to weight the multimix.
 
-                # Get attention from the last layer for the current (anchor) token
-                # outputs.attentions requires output_attentions=True, which is expensive.
-                # Instead, we use the logit probabilities as a proxy: re-run a single
-                # forward pass with output_attentions on just the last step.
-                # Actually, to keep things efficient, we'll use the softmax probs of
-                # each sequence position as a rough proxy for importance (higher confidence
-                # positions contribute more).
+                if len(multimix_embeds) < 2:
+                    # Only 1 token — not worth a multimix, emit as regular mix instead.
+                    # Don't roll back, just reset state and fall through.
+                    multimix_active = False
+                    saved_embed = multimix_embeds[0] if multimix_embeds else None
+                    saved_top = multimix_top_info[0] if multimix_top_info else top_tokens
+                    saved_unc = multimix_uncertainties[0] if multimix_uncertainties else uncertainty
+                    saved_id = multimix_token_ids[0] if multimix_token_ids else None
+                    multimix_embeds = []
+                    multimix_top_info = []
+                    multimix_token_ids = []
+                    multimix_uncertainties = []
+                    multimix_components = []
 
-                # Proxy: use inverse-uncertainty (top1 prob) at each position as weight
-                seq_top1_probs = []
-                for info in multimix_top_info:
-                    seq_top1_probs.append(info[0]["prob"])
-                anchor_attention = torch.tensor(seq_top1_probs, device=model.device)
-
-                # Build the collapsed multimix embedding
-                multimix_embed = _build_multimix_embed(
-                    multimix_embeds, None, anchor_attention
-                )
-                multimix_nearest = find_nearest_token(multimix_embed)
-
-                # Roll back: remove the sequence tokens from all_token_ids and recompute prev_text
-                for _ in multimix_token_ids:
-                    all_token_ids.pop()
-                prev_text = tokenizer.decode(all_token_ids, skip_special_tokens=True) if all_token_ids else ""
-
-                # Roll back KV cache: trim to before the sequence started
-                past_key_values = _trim_kv_cache(past_key_values, multimix_kv_start_len)
-
-                # Now feed the multimix embedding as a single token replacement
-                mm_input = {"inputs_embeds": multimix_embed.unsqueeze(0).unsqueeze(0).to(model.dtype)}
-                mm_outputs = _forward_step(mm_input, past_key_values)
-                past_key_values = mm_outputs.past_key_values
-
-                # Add the nearest token for decoding purposes
-                if multimix_nearest in eos_ids:
-                    break
-                all_token_ids.append(multimix_nearest)
-
-                display_text, prev_text = _try_decode(tokenizer, all_token_ids, prev_text)
-                if display_text is None:
-                    # Incomplete char — will resolve on next token
-                    # Now process the current (anchor) token normally below
-                    pass
+                    # The single token is already in all_token_ids and KV cache — just emit it
+                    # Only mark as mix if mix tokens are actually enabled
+                    if saved_id is not None:
+                        display_text, prev_text = _try_decode(tokenizer, all_token_ids, prev_text)
+                        if display_text is not None:
+                            saved_gap = saved_top[0]["prob"] - saved_top[1]["prob"] if len(saved_top) >= 2 else 1.0
+                            data = json.dumps({
+                                "token": display_text,
+                                "uncertainty": round(saved_unc, 4),
+                                "top": saved_top,
+                                "mix": saved_gap < MIX_THRESHOLD,
+                            })
+                            yield f"data: {data}\n\n"
+                    # Fall through to handle current token normally
                 else:
-                    # Emit the multimix token event
-                    # Collect all unique top tokens across the sequence for tooltip
-                    combined_top = multimix_top_info[0] if multimix_top_info else top_tokens
-                    avg_uncertainty = sum(multimix_uncertainties) / len(multimix_uncertainties) if multimix_uncertainties else uncertainty
+                    # Real multimix: 2+ tokens collected
 
-                    data = json.dumps({
-                        "token": display_text,
-                        "uncertainty": round(avg_uncertainty, 4),
-                        "top": combined_top,
-                        "mix": True,
-                        "multimix": True,
-                        "sequence_length": len(multimix_embeds),
-                    })
-                    yield f"data: {data}\n\n"
+                    # Proxy weights: top1 prob at each position
+                    seq_top1_probs = [info[0]["prob"] for info in multimix_top_info]
+                    anchor_attention = torch.tensor(seq_top1_probs, device=model.device)
+
+                    # Build the collapsed multimix embedding
+                    multimix_embed = _build_multimix_embed(
+                        multimix_embeds, None, anchor_attention
+                    )
+                    multimix_nearest = find_nearest_token(multimix_embed)
+
+                    # Roll back: remove the sequence tokens from all_token_ids and recompute prev_text
+                    for _ in multimix_token_ids:
+                        all_token_ids.pop()
+                    prev_text = tokenizer.decode(all_token_ids, skip_special_tokens=True) if all_token_ids else ""
+
+                    # Roll back KV cache: trim to before the sequence started
+                    past_key_values = _trim_kv_cache(past_key_values, multimix_kv_start_len)
+
+                    # Now feed the multimix embedding as a single token replacement
+                    mm_input = {"inputs_embeds": multimix_embed.unsqueeze(0).unsqueeze(0).to(model.dtype)}
+                    mm_outputs = _forward_step(mm_input, past_key_values)
+                    past_key_values = mm_outputs.past_key_values
+
+                    # Add the nearest token for decoding purposes
+                    if multimix_nearest in eos_ids:
+                        break
+                    all_token_ids.append(multimix_nearest)
+
+                    display_text, prev_text = _try_decode(tokenizer, all_token_ids, prev_text)
+                    if display_text is not None:
+                        avg_uncertainty = sum(multimix_uncertainties) / len(multimix_uncertainties)
+
+                        data = json.dumps({
+                            "token": display_text,
+                            "uncertainty": round(avg_uncertainty, 4),
+                            "top": multimix_top_info[0],
+                            "mix": True,
+                            "multimix": True,
+                            "sequence_length": len(multimix_embeds),
+                            "components": multimix_components,
+                        })
+                        yield f"data: {data}\n\n"
+
+                    # Start cooldown
+                    multimix_cooldown = 0
+
+                    # Recompute logits from the multimix forward pass
+                    logits = mm_outputs.logits[:, -1, :]
+                    probs = F.softmax(logits[0].float(), dim=-1)
+                    top10_probs, top10_ids = torch.topk(probs, 10)
+                    top_tokens = _top_tokens_info(tokenizer, top10_probs, top10_ids)
+                    uncertainty = 1.0 - top10_probs[0].item()
+                    gap = (top10_probs[0] - top10_probs[1]).item()
+                    is_mix = gap < MIX_THRESHOLD
+                    is_very_uncertain = gap < MULTIMIX_THRESHOLD
 
                 # Reset multimix state
                 multimix_active = False
@@ -267,29 +303,18 @@ def generate_tokens(messages: list[dict]):
                 multimix_top_info = []
                 multimix_token_ids = []
                 multimix_uncertainties = []
-
-                # Now handle the current anchor token (the certain one that ended the sequence)
-                # Fall through to normal processing below, but we need to re-run forward
-                # since we rewound the KV cache and fed the multimix embed.
-                # The mm_outputs already gave us a new logits — use those.
-                logits = mm_outputs.logits[:, -1, :]
-                probs = F.softmax(logits[0].float(), dim=-1)
-                top10_probs, top10_ids = torch.topk(probs, 10)
-                top_tokens = _top_tokens_info(tokenizer, top10_probs, top10_ids)
-                uncertainty = 1.0 - top10_probs[0].item()
-                gap = (top10_probs[0] - top10_probs[1]).item()
-                is_mix = gap < MIX_THRESHOLD
-                is_very_uncertain = gap < MULTIMIX_THRESHOLD
+                multimix_components = []
                 # Fall through to normal token handling
 
         # --- Check if we should START a new multimix sequence ---
-        if not multimix_active and is_very_uncertain and is_mix:
+        if not multimix_active and is_very_uncertain and multimix_cooldown >= MULTIMIX_COOLDOWN:
             # Start a multimix sequence
             multimix_active = True
             multimix_embeds = []
             multimix_top_info = []
             multimix_token_ids = []
             multimix_uncertainties = []
+            multimix_components = []
             # Record KV cache length *before* this uncertain token was processed.
             # past_key_values already includes the current step, so subtract 1.
             multimix_kv_start_len = _get_kv_len(past_key_values) - 1
@@ -304,6 +329,7 @@ def generate_tokens(messages: list[dict]):
             if nearest_id in eos_ids:
                 break
             multimix_token_ids.append(nearest_id)
+            multimix_components.append(decode_single_token(nearest_id))
             all_token_ids.append(nearest_id)
 
             model_inputs = {"inputs_embeds": mix_embed.unsqueeze(0).unsqueeze(0).to(model.dtype)}
@@ -324,6 +350,7 @@ def generate_tokens(messages: list[dict]):
                 model_inputs = {"inputs_embeds": mix_embed.unsqueeze(0).unsqueeze(0).to(model.dtype)}
                 continue
 
+            multimix_cooldown += 1
             data = json.dumps({
                 "token": display_text,
                 "uncertainty": round(uncertainty, 4),
@@ -346,6 +373,7 @@ def generate_tokens(messages: list[dict]):
                 model_inputs = {"input_ids": next_token_id.unsqueeze(0)}
                 continue
 
+            multimix_cooldown += 1
             data = json.dumps({
                 "token": display_text,
                 "uncertainty": round(uncertainty, 4),
